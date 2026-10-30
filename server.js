@@ -154,12 +154,21 @@ let accountRoundRobin = 0;
 let inFlight = 0;  // concurrent in-flight completions (backpressure cap)
 // Overall wall-clock budget for one inbound request (caps the retry/continuation
 // loops), max concurrent completions, and the empty-response retry cap.
-const REQUEST_DEADLINE_MS = Number(process.env.DEEPSEEK_REQUEST_DEADLINE_MS || 120000);
+// Plan B (unlimited retries): a negative DEEPSEEK_REQUEST_DEADLINE_MS (e.g. -1)
+// disables the wall-clock budget entirely.
+const configuredDeadlineMs = Number(process.env.DEEPSEEK_REQUEST_DEADLINE_MS);
+const UNLIMITED_DEADLINE = configuredDeadlineMs < 0;
+const REQUEST_DEADLINE_MS = UNLIMITED_DEADLINE
+    ? Infinity
+    : (Number.isFinite(configuredDeadlineMs) && configuredDeadlineMs > 0 ? configuredDeadlineMs : 120000);
 const MAX_CONCURRENT = Number(process.env.DEEPSEEK_MAX_CONCURRENT || 24);
+// Plan B (unlimited retries): a negative DEEPSEEK_MAX_RETRIES (e.g. -1) means
+// "retry forever"; otherwise the value is honored without the former hard cap
+// of 10.
 const configuredEmptyRetries = Number(process.env.DEEPSEEK_MAX_RETRIES);
-const MAX_EMPTY_RETRIES = Number.isFinite(configuredEmptyRetries)
-    ? Math.max(0, Math.min(10, Math.floor(configuredEmptyRetries)))
-    : 2;
+const MAX_EMPTY_RETRIES = configuredEmptyRetries < 0
+    ? Infinity
+    : (Number.isFinite(configuredEmptyRetries) ? Math.max(0, Math.floor(configuredEmptyRetries)) : 2);
 const MIN_UPSTREAM_PROMPT_CHARS = 16000;
 const configuredPromptChars = Number(process.env.DEEPSEEK_MAX_PROMPT_CHARS);
 const MAX_UPSTREAM_PROMPT_CHARS = Number.isFinite(configuredPromptChars)
@@ -1206,8 +1215,10 @@ function buildToolCallResponse(toolCall, model = 'deepseek-default', prompt = ''
             function: { name: toolCall.name, arguments: toolCall.arguments }
         }]
     };
-    // Do not attach reasoning to tool-call turns. Some agent clients treat any
-    // reasoning/text payload as a final assistant answer and stop their tool loop.
+    // Reasoning IS attached to tool-call turns so clients that render a thinking
+    // block (e.g. dsh-llm-deepseek, which maps reasoning_content to a reasoning
+    // block in streaming mode) can show the chain of thought for every step.
+    if (reasoningContent) message.reasoning_content = reasoningContent;
     return {
         id: 'ds-' + Date.now(),
         object: 'chat.completion',
@@ -1379,7 +1390,7 @@ function toAnthropicResponse(openaiResp) {
         },
         watermark: FORGETMEAI_WATERMARK,
     };
-    if (!hasToolCalls && msg.reasoning_content) response.reasoning_content = msg.reasoning_content;
+    if (msg.reasoning_content) response.reasoning_content = msg.reasoning_content;
     return response;
 }
 
@@ -1396,24 +1407,27 @@ function sendAnthropicStream(res, openaiResp) {
     const hasToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
     writeSse(res, 'message_start', { type: 'message_start', message: { ...message, content: [] } });
 
-    // Anthropic-compatible clients expect a tool turn to be made of tool_use
-    // content blocks. If we emit DeepSeek reasoning as a text block before the
-    // tool_use block, some agents treat the turn as a normal text answer and do
-    // not execute the tool. Keep tool streaming clean: tool_use blocks only.
+    // Tool turns now also carry the model's reasoning, emitted as a native
+    // Anthropic `thinking` block (not a text block) so Anthropic-compatible
+    // clients do not mistake it for the turn's final text answer and skip the
+    // tool_use blocks that follow.
+    let blockIndex = 0;
+    if (msg.reasoning_content) {
+        writeSse(res, 'content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'thinking', thinking: '' } });
+        writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'thinking_delta', thinking: msg.reasoning_content } });
+        writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: blockIndex });
+        blockIndex++;
+    }
     if (hasToolCalls) {
-        msg.tool_calls.forEach((tc, i) => {
+        msg.tool_calls.forEach((tc) => {
+            const i = blockIndex++;
             writeSse(res, 'content_block_start', { type: 'content_block_start', index: i, content_block: { type: 'tool_use', id: tc.id, name: tc.function.name, input: {} } });
             writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: i, delta: { type: 'input_json_delta', partial_json: tc.function.arguments || '{}' } });
             writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: i });
         });
         writeSse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: message.usage });
     } else {
-        if (msg.reasoning_content) {
-            writeSse(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
-            writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: `[reasoning]\n${msg.reasoning_content}\n[/reasoning]\n` } });
-            writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
-        }
-        const offset = msg.reasoning_content ? 1 : 0;
+        const offset = blockIndex;
         writeSse(res, 'content_block_start', { type: 'content_block_start', index: offset, content_block: { type: 'text', text: '' } });
         const text = msg.content || '';
         for (let i = 0; i < text.length; i += 80) {
@@ -1431,7 +1445,7 @@ function toResponsesResponse(openaiResp) {
     const msg = choice.message || {};
     const hasToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
     const output = [];
-    if (!hasToolCalls && msg.reasoning_content) {
+    if (msg.reasoning_content) {
         output.push({ id: 'rs_' + Date.now(), type: 'reasoning', summary: [{ type: 'summary_text', text: msg.reasoning_content }] });
     }
     if (hasToolCalls) {
@@ -1468,7 +1482,7 @@ function sendResponsesStream(res, openaiResp) {
     writeSse(res, 'response.created', { type: 'response.created', response: { ...response, status: 'in_progress', output: [] } });
     writeSse(res, 'response.in_progress', { type: 'response.in_progress', response: { ...response, status: 'in_progress', output: [] } });
     let outputIndex = 0;
-    if (!hasToolCalls && msg.reasoning_content) {
+    if (msg.reasoning_content) {
         const reasoningItem = { id: 'rs_' + Date.now(), type: 'reasoning', summary: [], status: 'completed' };
         writeSse(res, 'response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { ...reasoningItem, status: 'in_progress' } });
         writeSse(res, 'response.reasoning_summary_text.delta', { type: 'response.reasoning_summary_text.delta', output_index: outputIndex, summary_index: 0, delta: msg.reasoning_content });
@@ -1509,7 +1523,7 @@ function sendOpenAIStream(res, openaiResp) {
     const created = openaiResp.created;
     const model = openaiResp.model;
     const hasToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
-    if (!hasToolCalls && msg.reasoning_content) {
+    if (msg.reasoning_content) {
         for (let i = 0; i < msg.reasoning_content.length; i += 50) {
             const chunk = msg.reasoning_content.substring(i, i + 50);
             res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { reasoning_content: chunk }, finish_reason: null }] })}\n\n`);
@@ -1682,6 +1696,16 @@ function isContinuationRecoverySafe(previousAccountId, continuationCall) {
         || !nextAccountId
         || nextAccountId === previousAccountId
         || continuationCall?.freshSessionReset === true;
+}
+
+// Terminal upstream failures that retrying cannot fix: bad/expired credentials,
+// exhausted quota or balance. Plan B treats every other model error as
+// recoverable, so these are the only ones allowed to end an unlimited loop.
+function isTerminalUpstreamError(error) {
+    const message = typeof error === 'string'
+        ? error
+        : `${error?.content || ''} ${error?.message || ''} ${error?.type || ''}`;
+    return /(?:invalid|expired|bad)[\s_-]*(?:api[\s_-]*)?(?:key|token|credential)|unauthori[sz]ed|forbidden|insufficient[\s_-]*(?:quota|balance|credits?)|quota[\s_-]*(?:exceeded|exhausted)|balance[\s_-]*(?:exhausted|depleted)|out[\s_-]+of[\s_-]+(?:credits?|budget)|account[\s_-]*(?:disabled|banned|blocked)/i.test(message);
 }
 
 function isContextTooLongError(error) {
@@ -1986,7 +2010,27 @@ const server = http.createServer(async (req, res) => {
             }
 
             const startTime = Date.now();
-            const initialCall = await askDeepSeekStream(fullPrompt, agentId, requestedModel, freshPromptBuild.prompt);
+            // Plan B: the very first upstream call is retried too. Transient HTTP
+            // failures, timeouts, and an exhausted account pool (429 + Retry-After)
+            // all loop back after the advised wait instead of surfacing an error.
+            // Only a terminal credential/quota failure, a client disconnect, or the
+            // (possibly disabled) deadline ends the loop.
+            let initialCall = null;
+            let httpAttempt = 0;
+            while (!initialCall) {
+                try {
+                    initialCall = await askDeepSeekStream(fullPrompt, agentId, requestedModel, freshPromptBuild.prompt);
+                } catch (upstreamError) {
+                    if (clientGone) throw upstreamError;
+                    if (deadlineHit()) throw upstreamError;
+                    if (isTerminalUpstreamError(upstreamError)) throw upstreamError;
+                    if (++httpAttempt >= MAX_EMPTY_RETRIES) throw upstreamError;
+                    const advisedMs = Number.isFinite(upstreamError?.retryAfter) ? upstreamError.retryAfter * 1000 : 0;
+                    const waitMs = Math.max(advisedMs, Math.min(1000 * httpAttempt, 30000));
+                    console.log(`${agentTag} upstream call failed (${upstreamError.status || 'net'} ${upstreamError.message || ''}); retry ${httpAttempt}/${MAX_EMPTY_RETRIES} in ${Math.round(waitMs / 1000)}s`);
+                    await new Promise(r => setTimeout(r, waitMs));
+                }
+            }
             const dsResp = initialCall.resp;
             if (initialCall.promptUsed !== fullPrompt) {
                 fullPrompt = initialCall.promptUsed;
@@ -2097,15 +2141,30 @@ const server = http.createServer(async (req, res) => {
             console.log(`${agentTag} Got ${fullContent.length} chars (+${reasoningContent.length} reasoning chars) in ${elapsed}ms (msg#${session.messageCount})`);
 
             // Empty/context-overflow recovery. Each retry gets a smaller prompt
-            // and a fresh remote session; bounded attempts prevent retry storms.
+            // and a fresh remote session.
+            //
+            // MAX_EMPTY_RETRIES may be Infinity, but an infinite loop is only
+            // SAFE while retries make progress. A prompt the model keeps
+            // answering with reasoning-only (0 content chars) never improves, so
+            // MAX_STALLED_RETRIES bounds it: without that bound one request
+            // spins forever and the whole proxy looks dead.
+            const MAX_STALLED_RETRIES = 3;
             let retryAttempt = 0;
+            let stalledRetries = 0;
             while (!fullContent || fullContent.trim().length === 0) {
                 // Stop early if the client hung up or we've blown the request budget —
                 // no point burning more PoW solves + account quota for a dead socket.
                 if (clientGone) { console.log(`${agentTag} client disconnected; abandoning empty-retry loop`); return; }
                 if (deadlineHit()) { console.log(`${agentTag} request deadline hit; stopping empty-retry loop`); break; }
                 const contextTooLong = isContextTooLongError(modelError);
-                if (modelError && !contextTooLong) break;
+                // Plan B: any upstream model error that compaction could plausibly
+                // fix (including plain model errors, not just context-too-long) is
+                // retried. Only a credential/quota family failure ends the loop,
+                // because retrying it would just burn the same dead account.
+                if (modelError && !contextTooLong && isTerminalUpstreamError(modelError)) {
+                    console.log(`${agentTag} terminal upstream error (${modelError.type || 'error'}); not retrying`);
+                    break;
+                }
                 if (retryAttempt >= MAX_EMPTY_RETRIES) break;
                 retryAttempt++;
 
@@ -2122,8 +2181,10 @@ const server = http.createServer(async (req, res) => {
                 const reason = contextTooLong ? 'context-too-long response' : 'empty response';
                 console.log(`${agentTag} ${reason} (msg#${session.messageCount}, retry ${retryAttempt}/${MAX_EMPTY_RETRIES}, prompt=${retryPrompt.length} chars). Resetting session...`);
                 resetRemoteSession(session);
-                // Brief delay before retry to let DeepSeek breathe
-                await new Promise(r => setTimeout(r, Math.min(500 * retryAttempt, 1500)));
+                // Brief delay before retry to let DeepSeek breathe. Plan B backs
+                // off to 30s instead of 1.5s so an unlimited loop cannot hammer
+                // the upstream several times a second forever.
+                await new Promise(r => setTimeout(r, Math.min(1000 * retryAttempt, 30000)));
                 const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel);
                 const retryResult = await readDeepSeekResponse(retryResp.body);
                 const retryState = normalizeRetryResponse(retryResult);
@@ -2136,6 +2197,18 @@ const server = http.createServer(async (req, res) => {
                     console.log(`${agentTag} Retry ${retryAttempt} succeeded`);
                     fullContent = retryState.content;
                     reasoningContent = retryState.reasoningContent;
+                    stalledRetries = 0;
+                } else {
+                    // No progress. A thinking-only answer (reasoning chars, zero
+                    // content) is what a too-long prompt reliably produces, and
+                    // every further retry reproduces it, so stop once the stall
+                    // counter trips instead of spinning forever.
+                    stalledRetries++;
+                    if (retryState.reasoningContent) reasoningContent = retryState.reasoningContent;
+                    if (stalledRetries >= MAX_STALLED_RETRIES) {
+                        console.log(`${agentTag} no progress after ${retryAttempt} retries (${stalledRetries} consecutive empty); stopping`);
+                        break;
+                    }
                 }
             }
 
@@ -2147,7 +2220,7 @@ const server = http.createServer(async (req, res) => {
                 const errorMessage = modelError?.content
                     || (timedOut
                         ? 'DeepSeek request deadline reached while recovering an empty response'
-                        : `DeepSeek returned empty content after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}`);
+                        : `DeepSeek returned no content after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}${reasoningContent ? ` (it produced ${reasoningContent.length} reasoning chars but no answer; the prompt is probably too large for the web endpoint — lower DEEPSEEK_MAX_PROMPT_CHARS)` : ''}`);
                 console.log(`${agentTag} ${errorType} after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}. Giving up.`);
                 res.writeHead(failureClass.status, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
@@ -2170,9 +2243,10 @@ const server = http.createServer(async (req, res) => {
             }
 
             // Auto-continuation: if finish_reason is 'length' or content is very long (>25000 chars),
-            // send a continuation request to get the rest of the response
+            // send a continuation request to get the rest of the response.
+            // Plan B: continuation rounds are unlimited (Infinity).
             let continuationRounds = 0;
-            const MAX_CONTINUATION = 2;
+            const MAX_CONTINUATION = Infinity;
             while ((finishReason === 'length' || fullContent.length > 25000) && continuationRounds < MAX_CONTINUATION) {
                 if (clientGone || deadlineHit()) break;
                 continuationRounds++;
@@ -2222,12 +2296,18 @@ const server = http.createServer(async (req, res) => {
                 toolCall = null;
             }
             
-            // Retry once if legacy, XML, or DSML tool markup was truncated or
-            // malformed. Never pass raw DSML through as a normal assistant turn.
-            if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent) && !clientGone && !deadlineHit()) {
-                console.log(`${agentTag} Tool-call markup detected but invalid/truncated (${fullContent.length} chars). Retrying with stricter prompt...`);
+            // Repair legacy, XML, or DSML tool markup that arrived truncated or
+            // malformed. Plan B: this repair loop is unlimited (bounded by
+            // MAX_EMPTY_RETRIES = Infinity), so a flaky model gets as many
+            // stricter-prompt attempts as the client session allows. Never pass
+            // raw DSML through as a normal assistant turn.
+            let repairAttempt = 0;
+            while (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent) && !clientGone && !deadlineHit()) {
+                if (repairAttempt >= MAX_EMPTY_RETRIES) break;
+                repairAttempt++;
+                console.log(`${agentTag} Tool-call markup detected but invalid/truncated (${fullContent.length} chars). Repairing with stricter prompt (attempt ${repairAttempt}/${MAX_EMPTY_RETRIES})...`);
                 resetRemoteSession(session);
-                await new Promise(r => setTimeout(r, 1000));
+                await new Promise(r => setTimeout(r, Math.min(1000 * repairAttempt, 30000)));
                 const strictPrompt = appendPromptInstruction(
                     freshPromptBuild.prompt,
                     '[STRICT INSTRUCTION] Your previous response contained incomplete tool-call markup. Keep arguments short and output ONLY strict JSON: {"tool_call":{"name":"<function>","arguments":{...}}}'
@@ -2243,9 +2323,14 @@ const server = http.createServer(async (req, res) => {
                         reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : '';
                         toolCall = retryTc;
                     } else {
-                        console.log(`${agentTag} Retry still has broken tool markup. Returning a safe error instead of leaking it as text.`);
+                        console.log(`${agentTag} Repair attempt ${repairAttempt} still has broken tool markup; retrying.`);
                         reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : reasoningContent;
+                        // Keep the newest attempt as the failure evidence so the
+                        // loop condition re-evaluates real markup, not stale text.
+                        fullContent = retryContent2;
                     }
+                } else {
+                    console.log(`${agentTag} Repair attempt ${repairAttempt} returned no content; retrying.`);
                 }
             }
 
@@ -2253,13 +2338,14 @@ const server = http.createServer(async (req, res) => {
                 const failure = resetRemoteSession(session);
                 res.writeHead(502, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: {
-                    message: 'DeepSeek returned malformed tool-call markup after one repair attempt',
+                    message: `DeepSeek returned malformed tool-call markup after ${repairAttempt} repair attempt${repairAttempt === 1 ? '' : 's'}`,
                     type: 'malformed_tool_call',
                     agent: agentId,
                     failed_session_id: failure.failedSessionId,
                     message_count: failure.failedMessageCount,
                     history_length: session.history.length,
                     account: failure.accountId,
+                    repair_attempts: repairAttempt,
                     prompt_compacted: promptCompacted,
                     model: requestedModel,
                     real_model: resolveModelConfig(requestedModel).real_model,
@@ -2402,6 +2488,7 @@ async function main() {
     setInterval(sweepIdleSessions, 10 * 60 * 1000).unref();
     server.listen(PORT, HOST, () => {
         console.log(`[DS-API] Server on http://${HOST}:${PORT} (multi-agent sessions enabled)`);
+        console.log(`[DS-API] Retry policy: emptyRetries=${MAX_EMPTY_RETRIES === Infinity ? 'unlimited' : MAX_EMPTY_RETRIES}, deadline=${REQUEST_DEADLINE_MS === Infinity ? 'none' : REQUEST_DEADLINE_MS + 'ms'}, continuation=unlimited, maxConcurrent=${MAX_CONCURRENT}`);
         console.log(`[DS-API] ${formatWatermark()}`);
         console.log('[DS-API] POST /v1/chat/completions (OpenAI Chat Completions, stream=true|false)');
         console.log('[DS-API] POST /v1/messages — Anthropic Messages shim for Claude Code');
